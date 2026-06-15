@@ -6,7 +6,8 @@ from dotenv import load_dotenv
 load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
 from contextlib import asynccontextmanager
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from .database import connect_db, close_db
 from .routes.upload import router as upload_router
@@ -73,28 +74,62 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="EchoPeak API", lifespan=lifespan)
 
-# ── Health Check Endpoint ─────────────────────────────────────
-@app.get("/api/health")
-async def health():
-    return {"status": "ok", "service": "EchoPeak API"}
-
-
-from .config import FRONTEND_URL
-
-origins = [FRONTEND_URL] if FRONTEND_URL else ["*"]
-origins.extend(["http://localhost:3000", "http://localhost:5173", "https://echopeak.vercel.app"])
+# ── CORS Middleware (registered before routes to cover all responses) ──
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
         "https://echopeak.vercel.app",
         "http://localhost:3000",
-        "http://localhost:5173"
+        "http://localhost:5173",
     ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+# ── Request logging middleware ──────────────────────────────────────
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    logger.info("%s %s", request.method, request.url)
+    try:
+        response = await call_next(request)
+    except Exception as exc:
+        logger.exception("Unhandled exception during request: %s %s", request.method, request.url)
+        return JSONResponse(
+            status_code=500,
+            content={"error": str(exc)},
+        )
+    logger.info("%s %s → %s", request.method, request.url, response.status_code)
+    return response
+
+# ── Global exception handler ────────────────────────────────────────
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    logger.exception("Unhandled exception: %s", exc)
+    return JSONResponse(
+        status_code=500,
+        content={"error": str(exc)},
+    )
+
+# ── Debug Route ─────────────────────────────────────────────────────
+@app.get("/api/debug")
+async def debug():
+    return {"status": "ok", "message": "EchoPeak backend is reachable"}
+
+# ── Health Check Endpoint (with MongoDB ping) ──────────────────────
+@app.get("/api/health")
+async def health():
+    try:
+        from .database import get_db
+        db = get_db()
+        if db is not None:
+            await db.command("ping")
+            return {"status": "healthy", "mongodb": "connected"}
+        return {"status": "degraded", "mongodb": "not_initialized"}
+    except Exception as e:
+        return {"status": "error", "mongodb": str(e)}
+
+# ── Route registration ─────────────────────────────────────────────
 app.include_router(auth_router, prefix="/api")
 app.include_router(users_router, prefix="/api")
 app.include_router(analytics_router, prefix="/api")
