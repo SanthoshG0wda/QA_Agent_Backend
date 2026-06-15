@@ -1,6 +1,7 @@
 from motor.motor_asyncio import AsyncIOMotorClient
 from .config import MONGODB_URI
 
+DB_NAME = "call_qa"
 client = None
 db = None
 
@@ -8,7 +9,7 @@ db = None
 async def connect_db():
     global client, db
     client = AsyncIOMotorClient(MONGODB_URI, serverSelectionTimeoutMS=5000)
-    db = client.get_default_database()
+    db = client[DB_NAME]
     await client.admin.command("ping")
 
 
