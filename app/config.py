@@ -10,3 +10,4 @@ GROQ_MODEL = "llama-3.3-70b-versatile"
 NVIDIA_MODEL = "meta/llama-3.3-70b-instruct"
 NVIDIA_BASE_URL = "https://integrate.api.nvidia.com/v1"
 ENABLE_NIM = os.getenv("ENABLE_NIM", "true").lower() == "true"
+FRONTEND_URL = os.getenv("FRONTEND_URL", "")

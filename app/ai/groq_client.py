@@ -7,7 +7,7 @@ from ..services.json_parser import safe_json_parse
 
 logger = logging.getLogger(__name__)
 
-SYSTEM_PROMPT = """You are a Call Quality Analyst and conversation reconstructor.
+SYSTEM_PROMPT = """You are a conversation analyst and quality evaluator for call center recordings.
 
 INPUT HANDLING:
 - If the transcript has speaker labels ([SPEAKER_00], [Agent], [Customer], etc.), parse them into a structured conversation.

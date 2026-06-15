@@ -48,11 +48,14 @@ async def lifespan(app: FastAPI):
     await close_db()
 
 
-app = FastAPI(title="Call QA POC", lifespan=lifespan)
+app = FastAPI(title="EchoPeak API", lifespan=lifespan)
 
+from .config import FRONTEND_URL
+
+origins = [FRONTEND_URL] if FRONTEND_URL else ["*"]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
