@@ -2,12 +2,14 @@ import asyncio
 import logging
 from bson import ObjectId
 from bson.errors import InvalidId
-from fastapi import APIRouter, UploadFile, File, HTTPException, Depends
+from fastapi import APIRouter, UploadFile, File, Form, HTTPException, Depends
 from ..database import get_db
 from ..models.call import create_call_doc, call_to_dict
+from ..models.notification import create_notification_doc
 from ..auth.token_utils import get_current_user
 from ..services.transcription import transcribe_audio
 from ..services.evaluation_service import evaluate_call
+from ..config import MAX_CONCURRENT_JOBS
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -15,6 +17,27 @@ router = APIRouter()
 # Strong reference set to prevent GC from collecting background tasks
 _background_tasks: set[asyncio.Task] = set()
 _PROCESSING_TIMEOUT = 300  # 5 minutes max per call
+
+# Concurrency control semaphore — limits simultaneous Deepgram/Groq/NIM calls
+_processing_semaphore = asyncio.Semaphore(MAX_CONCURRENT_JOBS)
+
+# Queue tracking
+_queued_count = 0
+_running_count = 0
+
+
+async def _update_progress(call_id: str, progress: int, status: str = None):
+    db = get_db()
+    if db is None:
+        return
+    try:
+        obj_id = _validate_id(call_id, "call_id")
+        update = {"progress": progress}
+        if status:
+            update["processing_status"] = status
+        await db.calls.update_one({"_id": obj_id}, {"$set": update})
+    except Exception:
+        pass
 
 
 def _validate_id(id_str: str, name: str = "id") -> ObjectId:
@@ -25,9 +48,19 @@ def _validate_id(id_str: str, name: str = "id") -> ObjectId:
 
 
 async def _run_with_timeout(call_id: str, audio_bytes: bytes, content_type: str):
+    global _queued_count, _running_count
+    _queued_count += 1
+    await _update_progress(call_id, 0, "queued")
     try:
-        await asyncio.wait_for(_process_upload(call_id, audio_bytes, content_type), timeout=_PROCESSING_TIMEOUT)
+        async with _processing_semaphore:
+            _queued_count -= 1
+            _running_count += 1
+            await _update_progress(call_id, 5, "processing")
+            await asyncio.wait_for(_process_upload(call_id, audio_bytes, content_type), timeout=_PROCESSING_TIMEOUT)
+            _running_count -= 1
     except asyncio.TimeoutError:
+        _queued_count -= 1
+        _running_count -= 1
         logger.error("Upload %s: processing timed out after %ds", call_id, _PROCESSING_TIMEOUT)
         db = get_db()
         if db is not None:
@@ -51,25 +84,41 @@ async def _process_upload(call_id: str, audio_bytes: bytes, content_type: str):
     except HTTPException:
         return
 
-    await db.calls.update_one({"_id": obj_id}, {"$set": {"processing_status": "processing"}})
+    await db.calls.update_one({"_id": obj_id}, {"$set": {"processing_status": "processing", "progress": 10}})
 
     update_fields = {}
     try:
-        raw_transcript, utterances = await transcribe_audio(audio_bytes, content_type)
-        update_fields["transcript"] = raw_transcript
-        update_fields["deepgram_utterances"] = utterances
-        logger.info("Upload %s: Deepgram transcription completed (%d utterances)", call_id, len(utterances))
+        await _update_progress(call_id, 15)
+
+        # Reuse existing transcript if already stored (for re-evaluations)
+        existing_call = await db.calls.find_one({"_id": obj_id}, {"transcript": 1, "deepgram_utterances": 1})
+        if existing_call and existing_call.get("transcript") and existing_call.get("deepgram_utterances"):
+            raw_transcript = existing_call["transcript"]
+            utterances = existing_call["deepgram_utterances"]
+            logger.info("Upload %s: reusing existing transcript (%d utterances)", call_id, len(utterances))
+        else:
+            await _update_progress(call_id, 20)
+            raw_transcript, utterances, duration_seconds = await transcribe_audio(audio_bytes, content_type)
+            update_fields["transcript"] = raw_transcript
+            update_fields["deepgram_utterances"] = utterances
+            update_fields["duration_seconds"] = duration_seconds
+            logger.info("Upload %s: Deepgram transcription completed (%d utterances, %.1fs)", call_id, len(utterances), duration_seconds)
+
+        await _update_progress(call_id, 40)
 
         call_doc = await db.calls.find_one({"_id": obj_id})
         if not call_doc:
             return
 
         try:
+            await _update_progress(call_id, 50)
             eval_result = await evaluate_call(call_doc, utterances, raw_transcript)
+            await _update_progress(call_id, 90)
         except Exception as e:
             logger.error("Upload %s: evaluation pipeline failed: %s", call_id, e, exc_info=True)
             update_fields["processing_status"] = "failed"
             update_fields["eval_error"] = str(e)
+            update_fields["progress"] = 0
             await db.calls.update_one({"_id": obj_id}, {"$set": update_fields})
             return
 
@@ -99,7 +148,14 @@ async def _process_upload(call_id: str, audio_bytes: bytes, content_type: str):
         if eval_result.get("error"):
             update_fields["eval_error"] = eval_result["error"]
 
+        update_fields["overall_score"] = eval_result.get("overall_score", 0)
+        update_fields["critical_error"] = eval_result.get("critical_error", False)
+        update_fields["progress"] = 100
+
         await db.calls.update_one({"_id": obj_id}, {"$set": update_fields})
+
+        if eval_status == "completed":
+            asyncio.create_task(_create_notification(obj_id, eval_result))
 
         logger.info(
             "Upload %s processed in %.2f s (status=%s)",
@@ -109,14 +165,57 @@ async def _process_upload(call_id: str, audio_bytes: bytes, content_type: str):
         logger.error("Upload processing %s failed: %s", call_id, e, exc_info=True)
         update_fields["processing_status"] = "failed"
         update_fields["error"] = str(e)
+        update_fields["progress"] = 0
         await db.calls.update_one(
             {"_id": obj_id},
             {"$set": update_fields},
         )
 
 
+async def _create_notification(obj_id, eval_result):
+    try:
+        db = get_db()
+        if db is None:
+            return
+        call_doc = await db.calls.find_one({"_id": obj_id})
+        if call_doc:
+            agent_name = call_doc.get("agent_name", "Unknown")
+            dept_name = call_doc.get("department_name", "")
+            score = eval_result.get("overall_score", eval_result.get("processing_metrics", {}).get("overall_score", 0))
+            notif = create_notification_doc(
+                user_id=call_doc.get("uploaded_by", ""),
+                evaluation_id=eval_result.get("evaluation_id", ""),
+                title="Evaluation Completed",
+                message=f"{agent_name} - {dept_name}\nScore: {score}/100",
+            )
+            await db.notifications.insert_one(notif)
+    except Exception:
+        logger.warning("Failed to create notification (non-blocking)", exc_info=True)
+
+
+async def _next_job_id(db) -> str:
+    from datetime import datetime
+    year = datetime.utcnow().strftime("%Y")
+    prefix = f"EVL-{year}-"
+    last = await db.calls.find_one({"job_id": {"$regex": f"^{prefix}"}}, sort=[("job_id", -1)])
+    if last:
+        last_num = int(last["job_id"].split("-")[-1])
+        new_num = last_num + 1
+    else:
+        new_num = 1
+    return f"{prefix}{new_num:05d}"
+
+
 @router.post("/upload")
-async def upload_audio(file: UploadFile = File(...), payload: dict = Depends(get_current_user)):
+async def upload_audio(
+    file: UploadFile = File(...),
+    agent_id: str = Form(""),
+    agent_name: str = Form(""),
+    department_id: str = Form(""),
+    department_name: str = Form(""),
+    notes: str = Form(""),
+    payload: dict = Depends(get_current_user),
+):
     if not file.filename:
         raise HTTPException(400, "No file provided")
 
@@ -126,9 +225,30 @@ async def upload_audio(file: UploadFile = File(...), payload: dict = Depends(get
     db = get_db()
     if db is None:
         raise HTTPException(503, "Database not connected")
+
+    if agent_id and not agent_name:
+        try:
+            agent_doc = await db.agents.find_one({"_id": _validate_id(agent_id, "agent_id")})
+            if agent_doc:
+                agent_name = agent_doc.get("name", "")
+                if not department_id:
+                    department_id = agent_doc.get("department_id", "")
+                if not department_name:
+                    department_name = agent_doc.get("department_name", "")
+        except HTTPException:
+            pass
+
+    job_id = await _next_job_id(db)
+
     call_doc = create_call_doc(
         filename=file.filename,
         uploaded_by=payload.get("sub", ""),
+        agent_id=agent_id,
+        agent_name=agent_name,
+        department_id=department_id,
+        department_name=department_name,
+        notes=notes,
+        job_id=job_id,
     )
     result = await db.calls.insert_one(call_doc)
     call_id = str(result.inserted_id)
@@ -139,6 +259,7 @@ async def upload_audio(file: UploadFile = File(...), payload: dict = Depends(get
 
     return {
         "call_id": call_id,
+        "job_id": job_id,
         "status": "processing",
         "message": "Upload received. Processing started.",
     }

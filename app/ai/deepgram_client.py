@@ -13,9 +13,8 @@ DEFAULT_OPTIONS = {
     "language": "en",
     "smart_format": "true",
     "punctuate": "true",
-    "paragraphs": "true",
     "utterances": "true",
-    "diarize": "true",
+    "diarize": "false",
 }
 
 

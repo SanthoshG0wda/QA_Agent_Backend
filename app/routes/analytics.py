@@ -1,6 +1,15 @@
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException
+from bson import ObjectId
+from bson.errors import InvalidId
 from ..database import get_db
 from ..auth.token_utils import get_current_user
+
+
+def _validate_id(id_str: str, name: str = "id") -> ObjectId:
+    try:
+        return ObjectId(id_str)
+    except (InvalidId, TypeError):
+        raise HTTPException(400, f"Invalid {name}: '{id_str}' is not a valid ID")
 
 router = APIRouter(prefix="/analytics", tags=["analytics"])
 
@@ -52,6 +61,28 @@ async def get_category_stats(_=Depends(get_current_user)):
     if db is None:
         return {}
     evals = await db.evaluations.find().to_list(500)
+    if not evals:
+        return {}
+    keys = ["opening_score", "communication_score", "listening_score", "knowledge_score",
+            "discovery_score", "call_control_score", "professionalism_score",
+            "compliance_score", "closing_score"]
+    maxes = {"opening_score": 10, "communication_score": 15, "listening_score": 15,
+             "knowledge_score": 15, "discovery_score": 10, "call_control_score": 10,
+             "professionalism_score": 10, "compliance_score": 5, "closing_score": 5}
+    result = {}
+    for k in keys:
+        vals = [e.get(k, 0) for e in evals]
+        avg = sum(vals) / len(vals) if vals else 0
+        result[k.replace("_score", "")] = round(avg / maxes[k] * 100, 1)
+    return result
+
+
+@router.get("/department/{department_id}")
+async def department_analytics(department_id: str, _=Depends(get_current_user)):
+    db = get_db()
+    if db is None:
+        raise HTTPException(503, "Database not connected")
+    evals = await db.evaluations.find({"department_id": department_id}).to_list(500)
     if not evals:
         return {}
     keys = ["opening_score", "communication_score", "listening_score", "knowledge_score",

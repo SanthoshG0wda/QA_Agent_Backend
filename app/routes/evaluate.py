@@ -152,7 +152,7 @@ async def get_call_status(call_id: str, _=Depends(get_current_user)):
     if not call_doc:
         raise HTTPException(404, "Call not found")
     status = call_doc.get("processing_status", "pending")
-    result = {"call_id": call_id, "status": status}
+    result = {"call_id": call_id, "status": status, "progress": call_doc.get("progress", 0)}
     if status == "failed":
         result["error"] = call_doc.get("transcript_error") or call_doc.get("eval_error") or "Processing failed"
     eval_doc = await db.evaluations.find_one({"call_id": call_id})

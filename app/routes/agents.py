@@ -8,11 +8,20 @@ from ..models.agent import create_agent_doc, agent_to_dict
 from ..models.call import create_call_doc
 from ..models.evaluation import evaluation_to_dict
 from ..auth.token_utils import get_current_user, require_role
+from pydantic import BaseModel
 from ..services.transcription import transcribe_audio
 from ..services.evaluation_service import evaluate_call
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
+
+
+class AgentCreateBody(BaseModel):
+    name: str
+    email: str
+    department_id: str = ""
+    department_name: str = ""
+
 
 # Strong reference set to prevent GC from collecting background tasks
 _background_tasks: set[asyncio.Task] = set()
@@ -27,21 +36,30 @@ def _validate_id(id_str: str, name: str = "id") -> ObjectId:
 
 
 @router.post("/agents")
-async def create_agent(body: dict, _=Depends(require_role("admin"))):
+async def create_agent(body: AgentCreateBody, _=Depends(require_role("admin"))):
     db = get_db()
     if db is None:
         raise HTTPException(503, "Database not connected")
-    name = body.get("name", "").strip()
-    email = body.get("email", "").strip().lower()
-    department = body.get("department", "").strip()
+    name = body.name.strip()
+    email = body.email.strip().lower()
     if not name or not email:
         raise HTTPException(400, "Name and email are required")
     existing = await db.agents.find_one({"email": email})
     if existing:
         raise HTTPException(400, "Agent with this email already exists")
-    doc = create_agent_doc(name, email, department)
+    doc = create_agent_doc(name, email, body.department_id, body.department_name)
     result = await db.agents.insert_one(doc)
     return {"id": str(result.inserted_id)}
+
+
+@router.get("/agents/department/{department_id}")
+async def list_agents_by_department(department_id: str, _=Depends(get_current_user)):
+    db = get_db()
+    if db is None:
+        raise HTTPException(503, "Database not connected")
+    _validate_id(department_id, "department_id")
+    docs = await db.agents.find({"department_id": department_id}).sort("name", 1).to_list(100)
+    return [agent_to_dict(d) for d in docs]
 
 
 @router.get("/agents")
@@ -128,10 +146,11 @@ async def _process_agent_call(call_id: str, audio_bytes: bytes, content_type: st
 
     update_fields = {}
     try:
-        raw_transcript, utterances = await transcribe_audio(audio_bytes, content_type)
+        raw_transcript, utterances, duration_seconds = await transcribe_audio(audio_bytes, content_type)
         update_fields["transcript"] = raw_transcript
         update_fields["deepgram_utterances"] = utterances
-        logger.info("Agent call %s: Deepgram transcription completed (%d utterances)", call_id, len(utterances))
+        update_fields["duration_seconds"] = duration_seconds
+        logger.info("Agent call %s: Deepgram transcription completed (%d utterances, %.1fs)", call_id, len(utterances), duration_seconds)
 
         call_doc = await db.calls.find_one({"_id": obj_id})
         if not call_doc:
@@ -172,6 +191,9 @@ async def _process_agent_call(call_id: str, audio_bytes: bytes, content_type: st
         if eval_result.get("error"):
             update_fields["eval_error"] = eval_result["error"]
 
+        update_fields["overall_score"] = eval_result.get("overall_score", 0)
+        update_fields["critical_error"] = eval_result.get("critical_error", False)
+
         await db.calls.update_one({"_id": obj_id}, {"$set": update_fields})
 
         logger.info(
@@ -203,8 +225,18 @@ async def upload_agent_call(agent_id: str, file: UploadFile = File(...),
     content = await file.read()
     content_type = file.content_type or "audio/wav"
 
-    call_doc_data = create_call_doc(filename=file.filename, uploaded_by=str(agent_doc["_id"]))
-    call_doc_data["agent_id"] = agent_id
+    agent_name = agent_doc.get("name", "")
+    department_id = agent_doc.get("department_id", "")
+    department_name = agent_doc.get("department_name", "")
+
+    call_doc_data = create_call_doc(
+        filename=file.filename,
+        uploaded_by=str(agent_doc["_id"]),
+        agent_id=agent_id,
+        agent_name=agent_name,
+        department_id=department_id,
+        department_name=department_name,
+    )
     result = await db.calls.insert_one(call_doc_data)
     call_id = str(result.inserted_id)
 

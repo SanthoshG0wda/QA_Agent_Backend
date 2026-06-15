@@ -16,6 +16,9 @@ from .routes.users import router as users_router
 from .routes.analytics import router as analytics_router
 from .routes.agents import router as agents_router
 from .routes.performance import router as performance_router
+from .routes.departments import router as departments_router
+from .routes.notifications import router as notifications_router
+from .routes.jobs import router as jobs_router
 
 
 logger = logging.getLogger(__name__)
@@ -48,6 +51,20 @@ async def lifespan(app: FastAPI):
     else:
         logger.info("NVIDIA NIM disabled (ENABLE_NIM=false) — critical errors from Groq only")
 
+    try:
+        from .database import get_db
+        db = get_db()
+        if db is not None:
+            default_depts = ["Sales", "Customer Support", "Collections", "Renewals", "Inside Sales", "Marketing", "HR"]
+            for name in default_depts:
+                existing = await db.departments.find_one({"name": name})
+                if not existing:
+                    from .models.department import create_department_doc
+                    await db.departments.insert_one(create_department_doc(name))
+                    logger.info("Seeded default department: %s", name)
+    except Exception as e:
+        logger.warning("Could not seed default departments: %s", e)
+
     yield
     await close_db()
 
@@ -57,13 +74,10 @@ app = FastAPI(title="EchoPeak API", lifespan=lifespan)
 from .config import FRONTEND_URL
 
 origins = [FRONTEND_URL] if FRONTEND_URL else ["*"]
+origins.extend(["http://localhost:3000", "http://localhost:5173"])
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "https://echopeak.vercel.app",
-        "http://localhost:3000",
-        "http://localhost:5173"
-    ],
+    allow_origins=origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -75,3 +89,6 @@ app.include_router(upload_router, prefix="/api")
 app.include_router(evaluate_router, prefix="/api")
 app.include_router(agents_router, prefix="/api")
 app.include_router(performance_router, prefix="/api")
+app.include_router(departments_router, prefix="/api")
+app.include_router(notifications_router, prefix="/api")
+app.include_router(jobs_router, prefix="/api")

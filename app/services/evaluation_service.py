@@ -243,6 +243,8 @@ async def evaluate_call(call_doc: dict, deepgram_utterances: list[dict], raw_tra
         logger.error("Cannot save evaluation — database not connected")
         return {
             "evaluation_id": "",
+            "overall_score": scores.get("overall_score", 0),
+            "critical_error": groq_err or nim_err,
             "error": "Database not connected",
             "warnings": warnings + ["Database not connected"],
             "status": "failed",
@@ -268,6 +270,11 @@ async def evaluate_call(call_doc: dict, deepgram_utterances: list[dict], raw_tra
         status=eval_status,
         warnings=warnings,
         error=eval_error,
+        agent_id=call_doc.get("agent_id", ""),
+        agent_name=call_doc.get("agent_name", ""),
+        department_id=call_doc.get("department_id", ""),
+        department_name=call_doc.get("department_name", ""),
+        duration_seconds=call_doc.get("duration_seconds", 0),
     )
 
     t2 = time.time()
@@ -309,6 +316,8 @@ async def evaluate_call(call_doc: dict, deepgram_utterances: list[dict], raw_tra
 
     return {
         "evaluation_id": str(eval_result.inserted_id),
+        "overall_score": scores.get("overall_score", 0),
+        "critical_error": groq_err or nim_err,
         "agent_customer_transcript": agent_customer_text,
         "corrected_conversation": groq_result.get("corrected_conversation", []),
         "normalized_conversation": normalized,

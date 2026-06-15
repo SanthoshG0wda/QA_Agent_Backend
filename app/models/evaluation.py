@@ -4,7 +4,10 @@ from datetime import datetime, timezone
 def create_evaluation_doc(call_id: str, scores: dict, strengths: list, improvements: list,
                           critical_error: bool, critical_errors: list,
                           reviewed_by: str = None, status: str = "completed",
-                          warnings: list = None, error: str = None) -> dict:
+                          warnings: list = None, error: str = None,
+                          agent_id: str = "", agent_name: str = "",
+                          department_id: str = "", department_name: str = "",
+                          duration_seconds: int = 0) -> dict:
     return {
         "call_id": call_id,
         "status": status,
@@ -27,6 +30,11 @@ def create_evaluation_doc(call_id: str, scores: dict, strengths: list, improveme
         "review_status": "pending",
         "reviewed_by": reviewed_by,
         "review_notes": "",
+        "agent_id": agent_id,
+        "agent_name": agent_name,
+        "department_id": department_id,
+        "department_name": department_name,
+        "duration_seconds": duration_seconds,
         "created_at": datetime.now(timezone.utc),
     }
 
@@ -58,5 +66,10 @@ def evaluation_to_dict(doc) -> dict:
         "review_status": doc.get("review_status", "pending"),
         "reviewed_by": doc.get("reviewed_by"),
         "review_notes": doc.get("review_notes", ""),
+        "agent_id": doc.get("agent_id", ""),
+        "agent_name": doc.get("agent_name", ""),
+        "department_id": doc.get("department_id", ""),
+        "department_name": doc.get("department_name", ""),
+        "duration_seconds": doc.get("duration_seconds", 0),
         "created_at": created_at or "",
     }
