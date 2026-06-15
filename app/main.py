@@ -26,9 +26,9 @@ logger = logging.getLogger(__name__)
 
 # ── Startup dependency validation ──────────────────────────────────
 try:
-    import jwt
+    from jose import jwt
     import bcrypt
-    logger.info("Core dependencies validated (jwt, bcrypt)")
+    logger.info("Core dependencies validated (jose.jwt, bcrypt)")
 except Exception as e:
     raise RuntimeError(f"Core dependency missing: {e}")
 

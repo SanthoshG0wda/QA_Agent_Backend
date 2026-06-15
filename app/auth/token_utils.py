@@ -1,6 +1,7 @@
 import os
 from datetime import datetime, timedelta, timezone
-import jwt as pyjwt
+from jose import jwt
+from jose.exceptions import JWTError, ExpiredSignatureError
 from fastapi import HTTPException, Depends
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 
@@ -17,15 +18,15 @@ def create_access_token(user_id: str, role: str) -> str:
         "role": role,
         "exp": datetime.now(timezone.utc) + timedelta(days=ACCESS_TOKEN_EXPIRE_DAYS),
     }
-    return pyjwt.encode(payload, SECRET_KEY, algorithm=ALGORITHM)
+    return jwt.encode(payload, SECRET_KEY, algorithm=ALGORITHM)
 
 
 def decode_token(token: str) -> dict:
     try:
-        return pyjwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-    except pyjwt.ExpiredSignatureError:
+        return jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+    except ExpiredSignatureError:
         raise HTTPException(401, "Token expired")
-    except pyjwt.InvalidTokenError:
+    except JWTError:
         raise HTTPException(401, "Invalid token")
 
 
