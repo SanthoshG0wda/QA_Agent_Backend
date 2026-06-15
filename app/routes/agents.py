@@ -1,7 +1,7 @@
 import os
 import uuid
+import asyncio
 import logging
-import time
 from bson import ObjectId
 from bson.errors import InvalidId
 from fastapi import APIRouter, HTTPException, Depends, UploadFile, File
@@ -12,12 +12,14 @@ from ..models.call import create_call_doc
 from ..models.evaluation import evaluation_to_dict
 from ..auth.token_utils import get_current_user, require_role
 from ..services.transcription import transcribe_audio
-from ..services.diarization import diarize_audio, merge_with_transcript
 from ..services.evaluation_service import evaluate_call
-from ..services.timing import record_timing
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
+
+# Strong reference set to prevent GC from collecting background tasks
+_background_tasks: set[asyncio.Task] = set()
+_PROCESSING_TIMEOUT = 300
 
 
 def _validate_id(id_str: str, name: str = "id") -> ObjectId:
@@ -99,41 +101,55 @@ async def delete_agent(agent_id: str, _=Depends(require_role("admin"))):
     return {"ok": True}
 
 
+async def _run_agent_timeout(call_id: str, file_path: str):
+    try:
+        await asyncio.wait_for(_process_agent_call(call_id, file_path), timeout=_PROCESSING_TIMEOUT)
+    except asyncio.TimeoutError:
+        logger.error("Agent call %s: processing timed out after %ds", call_id, _PROCESSING_TIMEOUT)
+        db = get_db()
+        if db is not None:
+            try:
+                obj_id = _validate_id(call_id, "call_id")
+                await db.calls.update_one(
+                    {"_id": obj_id},
+                    {"$set": {"processing_status": "failed", "error": "Processing timed out"}},
+                )
+            except Exception:
+                pass
+
+
 async def _process_agent_call(call_id: str, file_path: str):
-    """Background processor for agent call uploads."""
-    import asyncio
+    """Background processor for agent call uploads using Deepgram."""
     from ..services.transcription import transcribe_audio
-    from ..services.diarization import diarize_audio, merge_with_transcript
     from ..services.evaluation_service import evaluate_call
-    from ..config import FAST_MODE
 
     db = get_db()
     if db is None:
         return
 
-    await db.calls.update_one({"_id": _validate_id(call_id, "call_id")}, {"$set": {"processing_status": "processing"}})
+    obj_id = _validate_id(call_id, "call_id")
+    await db.calls.update_one({"_id": obj_id}, {"$set": {"processing_status": "processing"}})
 
+    update_fields = {}
     try:
-        plain_transcript, whisper_segments = await transcribe_audio(file_path)
-        raw_transcript = plain_transcript
+        raw_transcript, utterances = await transcribe_audio(file_path)
+        update_fields["transcript"] = raw_transcript
+        update_fields["deepgram_utterances"] = utterances
+        logger.info("Agent call %s: Deepgram transcription completed (%d utterances)", call_id, len(utterances))
 
-        diarized = ""
-        if not FAST_MODE and whisper_segments:
-            diarization_segments = await diarize_audio(file_path)
-            if diarization_segments:
-                diarized = merge_with_transcript(whisper_segments, diarization_segments)
-
-        call_doc = await db.calls.find_one({"_id": _validate_id(call_id, "call_id")})
+        call_doc = await db.calls.find_one({"_id": obj_id})
         if not call_doc:
             return
 
-        eval_result = await evaluate_call(call_doc, diarized, raw_transcript)
+        try:
+            eval_result = await evaluate_call(call_doc, utterances, raw_transcript)
+        except Exception as e:
+            logger.error("Agent call %s: evaluation pipeline failed: %s", call_id, e, exc_info=True)
+            update_fields["processing_status"] = "failed"
+            update_fields["eval_error"] = str(e)
+            await db.calls.update_one({"_id": obj_id}, {"$set": update_fields})
+            return
 
-        update_fields = {"processing_status": "completed"}
-        if plain_transcript:
-            update_fields["transcript"] = plain_transcript
-        if diarized:
-            update_fields["diarized_transcript"] = diarized
         if eval_result.get("agent_customer_transcript"):
             update_fields["agent_customer_transcript"] = eval_result["agent_customer_transcript"]
         if eval_result.get("corrected_conversation"):
@@ -152,18 +168,27 @@ async def _process_agent_call(call_id: str, file_path: str):
             update_fields["pipeline_timing"] = eval_result["pipeline_timing"]
         if eval_result.get("pipeline_debug"):
             update_fields["pipeline_debug"] = eval_result["pipeline_debug"]
+        if eval_result.get("processing_metrics"):
+            update_fields["processing_metrics"] = eval_result["processing_metrics"]
 
-        await db.calls.update_one({"_id": _validate_id(call_id, "call_id")}, {"$set": update_fields})
+        eval_status = eval_result.get("status", "completed")
+        update_fields["processing_status"] = eval_status
+        if eval_result.get("error"):
+            update_fields["eval_error"] = eval_result["error"]
+
+        await db.calls.update_one({"_id": obj_id}, {"$set": update_fields})
 
         logger.info(
-            "Agent call %s processed in %.2f s (FAST_MODE=%s)",
-            call_id, eval_result.get("pipeline_timing", {}).get("total", 0), FAST_MODE,
+            "Agent call %s processed in %.2f s (status=%s)",
+            call_id, eval_result.get("pipeline_timing", {}).get("total", 0), eval_status,
         )
     except Exception as e:
         logger.error("Agent call %s processing failed: %s", call_id, e, exc_info=True)
+        update_fields["processing_status"] = "failed"
+        update_fields["error"] = str(e)
         await db.calls.update_one(
-            {"_id": _validate_id(call_id, "call_id")},
-            {"$set": {"processing_status": "failed"}},
+            {"_id": obj_id},
+            {"$set": update_fields},
         )
 
 
@@ -179,7 +204,6 @@ async def upload_agent_call(agent_id: str, file: UploadFile = File(...),
     if not file.filename:
         raise HTTPException(400, "No file provided")
 
-    import asyncio
     os.makedirs(UPLOAD_DIR, exist_ok=True)
     ext = os.path.splitext(file.filename)[1] or ".wav"
     stored_name = f"{uuid.uuid4()}{ext}"
@@ -194,11 +218,13 @@ async def upload_agent_call(agent_id: str, file: UploadFile = File(...),
     result = await db.calls.insert_one(call_doc_data)
     call_id = str(result.inserted_id)
 
-    asyncio.create_task(_process_agent_call(call_id, file_path))
+    task = asyncio.create_task(_run_agent_timeout(call_id, file_path))
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
 
     return {
         "call_id": call_id,
-        "status": "pending",
+        "status": "processing",
         "message": "Call upload received. Processing started. Poll GET /api/calls/{id} for status.",
     }
 

@@ -5,16 +5,19 @@ import logging
 from bson import ObjectId
 from bson.errors import InvalidId
 from fastapi import APIRouter, UploadFile, File, HTTPException, Depends
-from ..config import UPLOAD_DIR, FAST_MODE
+from ..config import UPLOAD_DIR
 from ..database import get_db
 from ..models.call import create_call_doc, call_to_dict
 from ..auth.token_utils import get_current_user
 from ..services.transcription import transcribe_audio
-from ..services.diarization import diarize_audio, merge_with_transcript
 from ..services.evaluation_service import evaluate_call
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
+
+# Strong reference set to prevent GC from collecting background tasks
+_background_tasks: set[asyncio.Task] = set()
+_PROCESSING_TIMEOUT = 300  # 5 minutes max per call
 
 
 def _validate_id(id_str: str, name: str = "id") -> ObjectId:
@@ -24,8 +27,26 @@ def _validate_id(id_str: str, name: str = "id") -> ObjectId:
         raise HTTPException(400, f"Invalid {name}: '{id_str}' is not a valid ID")
 
 
+async def _run_with_timeout(call_id: str, file_path: str):
+    """Wrap processing in a timeout so stuck tasks don't hang forever."""
+    try:
+        await asyncio.wait_for(_process_upload(call_id, file_path), timeout=_PROCESSING_TIMEOUT)
+    except asyncio.TimeoutError:
+        logger.error("Upload %s: processing timed out after %ds", call_id, _PROCESSING_TIMEOUT)
+        db = get_db()
+        if db is not None:
+            try:
+                obj_id = _validate_id(call_id, "call_id")
+                await db.calls.update_one(
+                    {"_id": obj_id},
+                    {"$set": {"processing_status": "failed", "error": "Processing timed out"}},
+                )
+            except Exception:
+                pass
+
+
 async def _process_upload(call_id: str, file_path: str):
-    """Background processor for uploaded calls."""
+    """Background processor for uploaded calls using Deepgram."""
     db = get_db()
     if db is None:
         return
@@ -37,27 +58,26 @@ async def _process_upload(call_id: str, file_path: str):
 
     await db.calls.update_one({"_id": obj_id}, {"$set": {"processing_status": "processing"}})
 
+    update_fields = {}
     try:
-        plain_transcript, whisper_segments = await transcribe_audio(file_path)
-        raw_transcript = plain_transcript
-
-        diarized = ""
-        if not FAST_MODE and whisper_segments:
-            diarization_segments = await diarize_audio(file_path)
-            if diarization_segments:
-                diarized = merge_with_transcript(whisper_segments, diarization_segments)
+        raw_transcript, utterances = await transcribe_audio(file_path)
+        update_fields["transcript"] = raw_transcript
+        update_fields["deepgram_utterances"] = utterances
+        logger.info("Upload %s: Deepgram transcription completed (%d utterances)", call_id, len(utterances))
 
         call_doc = await db.calls.find_one({"_id": obj_id})
         if not call_doc:
             return
 
-        eval_result = await evaluate_call(call_doc, diarized, raw_transcript)
+        try:
+            eval_result = await evaluate_call(call_doc, utterances, raw_transcript)
+        except Exception as e:
+            logger.error("Upload %s: evaluation pipeline failed: %s", call_id, e, exc_info=True)
+            update_fields["processing_status"] = "failed"
+            update_fields["eval_error"] = str(e)
+            await db.calls.update_one({"_id": obj_id}, {"$set": update_fields})
+            return
 
-        update_fields = {"processing_status": "completed"}
-        if plain_transcript:
-            update_fields["transcript"] = plain_transcript
-        if diarized:
-            update_fields["diarized_transcript"] = diarized
         if eval_result.get("agent_customer_transcript"):
             update_fields["agent_customer_transcript"] = eval_result["agent_customer_transcript"]
         if eval_result.get("corrected_conversation"):
@@ -76,18 +96,27 @@ async def _process_upload(call_id: str, file_path: str):
             update_fields["pipeline_timing"] = eval_result["pipeline_timing"]
         if eval_result.get("pipeline_debug"):
             update_fields["pipeline_debug"] = eval_result["pipeline_debug"]
+        if eval_result.get("processing_metrics"):
+            update_fields["processing_metrics"] = eval_result["processing_metrics"]
+
+        eval_status = eval_result.get("status", "completed")
+        update_fields["processing_status"] = eval_status
+        if eval_result.get("error"):
+            update_fields["eval_error"] = eval_result["error"]
 
         await db.calls.update_one({"_id": obj_id}, {"$set": update_fields})
 
         logger.info(
-            "Upload %s processed in %.2f s (FAST_MODE=%s)",
-            call_id, eval_result.get("pipeline_timing", {}).get("total", 0), FAST_MODE,
+            "Upload %s processed in %.2f s (status=%s)",
+            call_id, eval_result.get("pipeline_timing", {}).get("total", 0), eval_status,
         )
     except Exception as e:
         logger.error("Upload processing %s failed: %s", call_id, e, exc_info=True)
+        update_fields["processing_status"] = "failed"
+        update_fields["error"] = str(e)
         await db.calls.update_one(
             {"_id": obj_id},
-            {"$set": {"processing_status": "failed"}},
+            {"$set": update_fields},
         )
 
 
@@ -116,11 +145,13 @@ async def upload_audio(file: UploadFile = File(...), payload: dict = Depends(get
     result = await db.calls.insert_one(call_doc)
     call_id = str(result.inserted_id)
 
-    asyncio.create_task(_process_upload(call_id, file_path))
+    task = asyncio.create_task(_run_with_timeout(call_id, file_path))
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
 
     return {
         "call_id": call_id,
-        "status": "pending",
+        "status": "processing",
         "message": "Upload received. Processing started.",
     }
 
@@ -162,7 +193,7 @@ async def get_call_evaluation(call_id: str, _=Depends(get_current_user)):
             "call_id": call_id,
             "processing_status": call_doc.get("processing_status", "pending"),
             "transcript": call_doc.get("transcript", ""),
-            "diarized_transcript": call_doc.get("diarized_transcript", ""),
+            "deepgram_utterances": call_doc.get("deepgram_utterances", []),
             "agent_customer_transcript": call_doc.get("agent_customer_transcript", ""),
             "corrected_conversation": call_doc.get("corrected_conversation", []),
             "normalized_conversation": call_doc.get("normalized_conversation", []),
@@ -178,7 +209,7 @@ async def get_call_evaluation(call_id: str, _=Depends(get_current_user)):
     from ..models.evaluation import evaluation_to_dict
     result = evaluation_to_dict(eval_doc)
     result["transcript"] = call_doc.get("transcript", "")
-    result["diarized_transcript"] = call_doc.get("diarized_transcript", "")
+    result["deepgram_utterances"] = call_doc.get("deepgram_utterances", [])
     result["agent_customer_transcript"] = call_doc.get("agent_customer_transcript", "")
     result["corrected_conversation"] = call_doc.get("corrected_conversation", [])
     result["normalized_conversation"] = call_doc.get("normalized_conversation", [])

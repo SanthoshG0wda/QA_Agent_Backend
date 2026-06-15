@@ -1,14 +1,10 @@
 import os
 import logging
-import time
-import asyncio
 from bson import ObjectId
 from bson.errors import InvalidId
 from fastapi import APIRouter, HTTPException, Depends
 from ..database import get_db
-from ..config import FAST_MODE
 from ..services.transcription import transcribe_audio
-from ..services.diarization import diarize_audio, merge_with_transcript
 from ..services.evaluation_service import evaluate_call
 from ..models.evaluation import evaluation_to_dict
 from ..auth.token_utils import get_current_user
@@ -18,7 +14,6 @@ router = APIRouter()
 
 
 def _validate_id(id_str: str, name: str = "id") -> ObjectId:
-    """Validate and convert a string ID to ObjectId. Raises 400 on invalid."""
     try:
         return ObjectId(id_str)
     except (InvalidId, TypeError):
@@ -36,31 +31,39 @@ async def evaluate_call_endpoint(call_id: str, _=Depends(get_current_user)):
     if not call_doc:
         raise HTTPException(404, "Call not found")
 
+    await db.calls.update_one({"_id": obj_id}, {"$set": {"processing_status": "processing"}})
+
     file_path = call_doc.get("file_path", "")
-    plain_transcript = call_doc.get("transcript", "")
-    whisper_segments = []
-    raw_transcript = ""
+    raw_transcript = call_doc.get("transcript", "")
+    utterances = call_doc.get("deepgram_utterances", [])
 
-    if file_path and os.path.exists(file_path) and not plain_transcript:
-        plain_transcript, whisper_segments = await transcribe_audio(file_path)
-        raw_transcript = plain_transcript
-    elif file_path and os.path.exists(file_path):
-        _, whisper_segments = await transcribe_audio(file_path)
+    if file_path and os.path.exists(file_path) and not raw_transcript:
+        try:
+            raw_transcript, utterances = await transcribe_audio(file_path)
+            logger.info("Transcription completed for call %s (%d utterances)", call_id, len(utterances))
+        except Exception as e:
+            logger.error("Transcription failed for call %s: %s", call_id, e, exc_info=True)
+            await db.calls.update_one(
+                {"_id": obj_id},
+                {"$set": {"processing_status": "failed", "transcript_error": str(e)}},
+            )
+            raise HTTPException(500, f"Transcription failed: {e}")
 
-    diarized = call_doc.get("diarized_transcript", "")
+    try:
+        eval_result = await evaluate_call(call_doc, utterances, raw_transcript)
+    except Exception as e:
+        logger.error("Evaluation pipeline failed for call %s: %s", call_id, e, exc_info=True)
+        await db.calls.update_one(
+            {"_id": obj_id},
+            {"$set": {"processing_status": "failed", "eval_error": str(e)}},
+        )
+        raise HTTPException(500, f"Evaluation failed: {e}")
 
-    if not FAST_MODE and whisper_segments and not diarized:
-        diarization_segments = await diarize_audio(file_path)
-        if diarization_segments:
-            diarized = merge_with_transcript(whisper_segments, diarization_segments)
-
-    eval_result = await evaluate_call(call_doc, diarized, raw_transcript)
-
-    update_fields = {}
-    if plain_transcript:
-        update_fields["transcript"] = plain_transcript
-    if diarized:
-        update_fields["diarized_transcript"] = diarized
+    update_fields = {"processing_status": "completed"}
+    if raw_transcript:
+        update_fields["transcript"] = raw_transcript
+    if utterances:
+        update_fields["deepgram_utterances"] = utterances
     if eval_result.get("agent_customer_transcript"):
         update_fields["agent_customer_transcript"] = eval_result["agent_customer_transcript"]
     if eval_result.get("corrected_conversation"):
@@ -79,13 +82,15 @@ async def evaluate_call_endpoint(call_id: str, _=Depends(get_current_user)):
         update_fields["pipeline_timing"] = eval_result["pipeline_timing"]
     if eval_result.get("pipeline_debug"):
         update_fields["pipeline_debug"] = eval_result["pipeline_debug"]
+    if eval_result.get("processing_metrics"):
+        update_fields["processing_metrics"] = eval_result["processing_metrics"]
 
-    if update_fields:
-        await db.calls.update_one({"_id": obj_id}, {"$set": update_fields})
+    await db.calls.update_one({"_id": obj_id}, {"$set": update_fields})
 
     logger.info(
-        "Call %s evaluated in %.2f s (FAST_MODE=%s)",
-        call_id, eval_result.get("pipeline_timing", {}).get("total", 0), FAST_MODE,
+        "Call %s evaluated in %.2f s (status=%s)",
+        call_id, eval_result.get("pipeline_timing", {}).get("total", 0),
+        eval_result.get("status", "completed"),
     )
 
     return {"evaluation_id": eval_result["evaluation_id"]}
@@ -110,7 +115,7 @@ async def get_evaluation(evaluation_id: str, _=Depends(get_current_user)):
 
     if call_doc:
         result["transcript"] = call_doc.get("transcript", "")
-        result["diarized_transcript"] = call_doc.get("diarized_transcript", "")
+        result["deepgram_utterances"] = call_doc.get("deepgram_utterances", [])
         result["agent_customer_transcript"] = call_doc.get("agent_customer_transcript", "")
         result["corrected_conversation"] = call_doc.get("corrected_conversation", [])
         result["normalized_conversation"] = call_doc.get("normalized_conversation", [])
@@ -136,7 +141,7 @@ async def get_evaluation(evaluation_id: str, _=Depends(get_current_user)):
             result["agent_department"] = ""
     else:
         result["transcript"] = ""
-        result["diarized_transcript"] = ""
+        result["deepgram_utterances"] = []
         result["agent_customer_transcript"] = ""
         result["corrected_conversation"] = []
         result["normalized_conversation"] = []
@@ -149,6 +154,26 @@ async def get_evaluation(evaluation_id: str, _=Depends(get_current_user)):
         result["agent_id"] = ""
         result["agent_name"] = ""
         result["agent_department"] = ""
+    return result
+
+
+@router.get("/calls/{call_id}/status")
+async def get_call_status(call_id: str, _=Depends(get_current_user)):
+    obj_id = _validate_id(call_id, "call_id")
+    db = get_db()
+    if db is None:
+        raise HTTPException(503, "Database not connected")
+    call_doc = await db.calls.find_one({"_id": obj_id})
+    if not call_doc:
+        raise HTTPException(404, "Call not found")
+    status = call_doc.get("processing_status", "pending")
+    result = {"call_id": call_id, "status": status}
+    if status == "failed":
+        result["error"] = call_doc.get("transcript_error") or call_doc.get("eval_error") or "Processing failed"
+    eval_doc = await db.evaluations.find_one({"call_id": call_id})
+    if eval_doc:
+        result["evaluation_id"] = str(eval_doc["_id"])
+        result["evaluation_status"] = eval_doc.get("status", "completed")
     return result
 
 

@@ -1,4 +1,5 @@
 import os
+import logging
 from pathlib import Path
 from dotenv import load_dotenv
 
@@ -15,13 +16,34 @@ from .routes.users import router as users_router
 from .routes.analytics import router as analytics_router
 from .routes.agents import router as agents_router
 from .routes.performance import router as performance_router
-from .services.transcription import load_model as load_whisper_model
+
+logger = logging.getLogger(__name__)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await connect_db()
-    load_whisper_model()
+
+    from .config import DEEPGRAM_API_KEY, GROQ_API_KEY, ENABLE_NIM
+    if DEEPGRAM_API_KEY:
+        logger.info("Deepgram API key configured")
+    else:
+        logger.warning("DEEPGRAM_API_KEY not set — transcription will fail")
+
+    if GROQ_API_KEY:
+        logger.info("Groq API key configured")
+    else:
+        logger.warning("GROQ_API_KEY not set — evaluation will use fallback scores")
+
+    if ENABLE_NIM:
+        from .config import NVIDIA_API_KEY
+        if NVIDIA_API_KEY:
+            logger.info("NVIDIA NIM enabled (ENABLE_NIM=true)")
+        else:
+            logger.warning("ENABLE_NIM=true but NVIDIA_API_KEY not set — NIM will be skipped")
+    else:
+        logger.info("NVIDIA NIM disabled (ENABLE_NIM=false) — critical errors from Groq only")
+
     yield
     await close_db()
 

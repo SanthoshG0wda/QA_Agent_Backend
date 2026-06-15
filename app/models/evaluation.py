@@ -3,9 +3,11 @@ from datetime import datetime, timezone
 
 def create_evaluation_doc(call_id: str, scores: dict, strengths: list, improvements: list,
                           critical_error: bool, critical_errors: list,
-                          reviewed_by: str = None) -> dict:
+                          reviewed_by: str = None, status: str = "completed",
+                          warnings: list = None, error: str = None) -> dict:
     return {
         "call_id": call_id,
+        "status": status,
         "opening_score": scores.get("opening_score", 0),
         "communication_score": scores.get("communication_score", 0),
         "listening_score": scores.get("listening_score", 0),
@@ -20,6 +22,8 @@ def create_evaluation_doc(call_id: str, scores: dict, strengths: list, improveme
         "improvements": improvements,
         "critical_error": critical_error,
         "critical_errors": critical_errors,
+        "warnings": warnings or [],
+        "error": error,
         "review_status": "pending",
         "reviewed_by": reviewed_by,
         "review_notes": "",
@@ -34,6 +38,7 @@ def evaluation_to_dict(doc) -> dict:
     return {
         "id": str(doc.get("_id", "")),
         "call_id": doc.get("call_id", ""),
+        "status": doc.get("status", "completed"),
         "opening_score": doc.get("opening_score", 0),
         "communication_score": doc.get("communication_score", 0),
         "listening_score": doc.get("listening_score", 0),
@@ -48,6 +53,8 @@ def evaluation_to_dict(doc) -> dict:
         "improvements": doc.get("improvements", []),
         "critical_error": doc.get("critical_error", False),
         "critical_errors": doc.get("critical_errors", []),
+        "warnings": doc.get("warnings", []),
+        "error": doc.get("error"),
         "review_status": doc.get("review_status", "pending"),
         "reviewed_by": doc.get("reviewed_by"),
         "review_notes": doc.get("review_notes", ""),
