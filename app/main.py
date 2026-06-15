@@ -17,12 +17,16 @@ from .routes.analytics import router as analytics_router
 from .routes.agents import router as agents_router
 from .routes.performance import router as performance_router
 
+
 logger = logging.getLogger(__name__)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    await connect_db()
+    try:
+        await connect_db()
+    except Exception as e:
+        logger.error("Database connection failed: %s", e)
 
     from .config import DEEPGRAM_API_KEY, GROQ_API_KEY, ENABLE_NIM
     if DEEPGRAM_API_KEY:
@@ -55,12 +59,15 @@ from .config import FRONTEND_URL
 origins = [FRONTEND_URL] if FRONTEND_URL else ["*"]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins,
+    allow_origins=[
+        "https://echopeak.vercel.app",
+        "http://localhost:3000",
+        "http://localhost:5173"
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
 app.include_router(auth_router, prefix="/api")
 app.include_router(users_router, prefix="/api")
 app.include_router(analytics_router, prefix="/api")
