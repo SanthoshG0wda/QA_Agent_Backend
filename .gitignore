@@ -1,5 +1,5 @@
 .env
 Pipfile
 test_diarization_debug.py
-/uploads
-/app/__pycache__
+/uploads/
+/app/__pycache__/
