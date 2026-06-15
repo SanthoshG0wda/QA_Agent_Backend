@@ -74,7 +74,7 @@ app = FastAPI(title="EchoPeak API", lifespan=lifespan)
 from .config import FRONTEND_URL
 
 origins = [FRONTEND_URL] if FRONTEND_URL else ["*"]
-origins.extend(["http://localhost:3000", "http://localhost:5173"])
+origins.extend(["http://localhost:3000", "http://localhost:5173", "https://echopeak.vercel.app"])
 app.add_middleware(
     CORSMiddleware,
     allow_origins=origins,
