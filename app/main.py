@@ -24,6 +24,14 @@ from .routes.jobs import router as jobs_router
 
 logger = logging.getLogger(__name__)
 
+# ── Startup dependency validation ──────────────────────────────────
+try:
+    import jwt
+    import bcrypt
+    logger.info("Core dependencies validated (jwt, bcrypt)")
+except Exception as e:
+    raise RuntimeError(f"Core dependency missing: {e}")
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
