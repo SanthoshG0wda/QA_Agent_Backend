@@ -1,0 +1,55 @@
+from datetime import datetime, timezone
+
+
+def create_evaluation_doc(call_id: str, scores: dict, strengths: list, improvements: list,
+                          critical_error: bool, critical_errors: list,
+                          reviewed_by: str = None) -> dict:
+    return {
+        "call_id": call_id,
+        "opening_score": scores.get("opening_score", 0),
+        "communication_score": scores.get("communication_score", 0),
+        "listening_score": scores.get("listening_score", 0),
+        "knowledge_score": scores.get("knowledge_score", 0),
+        "discovery_score": scores.get("discovery_score", 0),
+        "call_control_score": scores.get("call_control_score", 0),
+        "professionalism_score": scores.get("professionalism_score", 0),
+        "compliance_score": scores.get("compliance_score", 0),
+        "closing_score": scores.get("closing_score", 0),
+        "overall_score": scores.get("overall_score", 0),
+        "strengths": strengths,
+        "improvements": improvements,
+        "critical_error": critical_error,
+        "critical_errors": critical_errors,
+        "review_status": "pending",
+        "reviewed_by": reviewed_by,
+        "review_notes": "",
+        "created_at": datetime.now(timezone.utc),
+    }
+
+
+def evaluation_to_dict(doc) -> dict:
+    created_at = doc.get("created_at")
+    if created_at is not None:
+        created_at = created_at.isoformat()
+    return {
+        "id": str(doc.get("_id", "")),
+        "call_id": doc.get("call_id", ""),
+        "opening_score": doc.get("opening_score", 0),
+        "communication_score": doc.get("communication_score", 0),
+        "listening_score": doc.get("listening_score", 0),
+        "knowledge_score": doc.get("knowledge_score", 0),
+        "discovery_score": doc.get("discovery_score", 0),
+        "call_control_score": doc.get("call_control_score", 0),
+        "professionalism_score": doc.get("professionalism_score", 0),
+        "compliance_score": doc.get("compliance_score", 0),
+        "closing_score": doc.get("closing_score", 0),
+        "overall_score": doc.get("overall_score", 0),
+        "strengths": doc.get("strengths", []),
+        "improvements": doc.get("improvements", []),
+        "critical_error": doc.get("critical_error", False),
+        "critical_errors": doc.get("critical_errors", []),
+        "review_status": doc.get("review_status", "pending"),
+        "reviewed_by": doc.get("reviewed_by"),
+        "review_notes": doc.get("review_notes", ""),
+        "created_at": created_at or "",
+    }
