@@ -77,11 +77,16 @@ origins = [FRONTEND_URL] if FRONTEND_URL else ["*"]
 origins.extend(["http://localhost:3000", "http://localhost:5173", "https://echopeak.vercel.app"])
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins,
+    allow_origins=[
+        "https://echopeak.vercel.app",
+        "http://localhost:3000",
+        "http://localhost:5173"
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
 app.include_router(auth_router, prefix="/api")
 app.include_router(users_router, prefix="/api")
 app.include_router(analytics_router, prefix="/api")
