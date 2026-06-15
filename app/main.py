@@ -65,11 +65,19 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning("Could not seed default departments: %s", e)
 
+    logger.info("EchoPeak backend started successfully")
     yield
     await close_db()
+    logger.info("EchoPeak backend shut down")
 
 
 app = FastAPI(title="EchoPeak API", lifespan=lifespan)
+
+# ── Health Check Endpoint ─────────────────────────────────────
+@app.get("/api/health")
+async def health():
+    return {"status": "ok", "service": "EchoPeak API"}
+
 
 from .config import FRONTEND_URL
 
