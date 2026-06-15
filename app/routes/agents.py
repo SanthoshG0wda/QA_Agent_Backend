@@ -1,11 +1,8 @@
-import os
-import uuid
 import asyncio
 import logging
 from bson import ObjectId
 from bson.errors import InvalidId
 from fastapi import APIRouter, HTTPException, Depends, UploadFile, File
-from ..config import UPLOAD_DIR
 from ..database import get_db
 from ..models.agent import create_agent_doc, agent_to_dict
 from ..models.call import create_call_doc
@@ -101,9 +98,9 @@ async def delete_agent(agent_id: str, _=Depends(require_role("admin"))):
     return {"ok": True}
 
 
-async def _run_agent_timeout(call_id: str, file_path: str):
+async def _run_agent_timeout(call_id: str, audio_bytes: bytes, content_type: str):
     try:
-        await asyncio.wait_for(_process_agent_call(call_id, file_path), timeout=_PROCESSING_TIMEOUT)
+        await asyncio.wait_for(_process_agent_call(call_id, audio_bytes, content_type), timeout=_PROCESSING_TIMEOUT)
     except asyncio.TimeoutError:
         logger.error("Agent call %s: processing timed out after %ds", call_id, _PROCESSING_TIMEOUT)
         db = get_db()
@@ -118,8 +115,7 @@ async def _run_agent_timeout(call_id: str, file_path: str):
                 pass
 
 
-async def _process_agent_call(call_id: str, file_path: str):
-    """Background processor for agent call uploads using Deepgram."""
+async def _process_agent_call(call_id: str, audio_bytes: bytes, content_type: str):
     from ..services.transcription import transcribe_audio
     from ..services.evaluation_service import evaluate_call
 
@@ -132,7 +128,7 @@ async def _process_agent_call(call_id: str, file_path: str):
 
     update_fields = {}
     try:
-        raw_transcript, utterances = await transcribe_audio(file_path)
+        raw_transcript, utterances = await transcribe_audio(audio_bytes, content_type)
         update_fields["transcript"] = raw_transcript
         update_fields["deepgram_utterances"] = utterances
         logger.info("Agent call %s: Deepgram transcription completed (%d utterances)", call_id, len(utterances))
@@ -204,21 +200,15 @@ async def upload_agent_call(agent_id: str, file: UploadFile = File(...),
     if not file.filename:
         raise HTTPException(400, "No file provided")
 
-    os.makedirs(UPLOAD_DIR, exist_ok=True)
-    ext = os.path.splitext(file.filename)[1] or ".wav"
-    stored_name = f"{uuid.uuid4()}{ext}"
-    file_path = os.path.join(UPLOAD_DIR, stored_name)
     content = await file.read()
-    with open(file_path, "wb") as f:
-        f.write(content)
+    content_type = file.content_type or "audio/wav"
 
-    call_doc_data = create_call_doc(filename=file.filename, file_path=file_path,
-                                    uploaded_by=str(agent_doc["_id"]))
+    call_doc_data = create_call_doc(filename=file.filename, uploaded_by=str(agent_doc["_id"]))
     call_doc_data["agent_id"] = agent_id
     result = await db.calls.insert_one(call_doc_data)
     call_id = str(result.inserted_id)
 
-    task = asyncio.create_task(_run_agent_timeout(call_id, file_path))
+    task = asyncio.create_task(_run_agent_timeout(call_id, content, content_type))
     _background_tasks.add(task)
     task.add_done_callback(_background_tasks.discard)
 

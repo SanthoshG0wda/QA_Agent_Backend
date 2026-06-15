@@ -1,10 +1,8 @@
-import os
 import logging
 from bson import ObjectId
 from bson.errors import InvalidId
 from fastapi import APIRouter, HTTPException, Depends
 from ..database import get_db
-from ..services.transcription import transcribe_audio
 from ..services.evaluation_service import evaluate_call
 from ..models.evaluation import evaluation_to_dict
 from ..auth.token_utils import get_current_user
@@ -33,21 +31,8 @@ async def evaluate_call_endpoint(call_id: str, _=Depends(get_current_user)):
 
     await db.calls.update_one({"_id": obj_id}, {"$set": {"processing_status": "processing"}})
 
-    file_path = call_doc.get("file_path", "")
     raw_transcript = call_doc.get("transcript", "")
     utterances = call_doc.get("deepgram_utterances", [])
-
-    if file_path and os.path.exists(file_path) and not raw_transcript:
-        try:
-            raw_transcript, utterances = await transcribe_audio(file_path)
-            logger.info("Transcription completed for call %s (%d utterances)", call_id, len(utterances))
-        except Exception as e:
-            logger.error("Transcription failed for call %s: %s", call_id, e, exc_info=True)
-            await db.calls.update_one(
-                {"_id": obj_id},
-                {"$set": {"processing_status": "failed", "transcript_error": str(e)}},
-            )
-            raise HTTPException(500, f"Transcription failed: {e}")
 
     try:
         eval_result = await evaluate_call(call_doc, utterances, raw_transcript)

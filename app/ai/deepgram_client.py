@@ -1,7 +1,6 @@
 import httpx
 import logging
 import time
-import mimetypes
 from ..config import DEEPGRAM_API_KEY
 from ..services.timing import record_timing
 
@@ -20,30 +19,22 @@ DEFAULT_OPTIONS = {
 }
 
 
-async def transcribe_audio(file_path: str) -> dict:
+async def transcribe_audio(audio_bytes: bytes, content_type: str = "audio/wav") -> dict:
     if not DEEPGRAM_API_KEY:
         raise RuntimeError("DEEPGRAM_API_KEY is not set")
 
     t0 = time.time()
-    mime_type, _ = mimetypes.guess_type(file_path)
-    if mime_type is None:
-        mime_type = "audio/wav"
-
-    t_read = time.time()
-    with open(file_path, "rb") as f:
-        audio_data = f.read()
-    file_read_time = time.time() - t_read
-    logger.info("TIMING [file_read]: %.3f s (%d bytes)", file_read_time, len(audio_data))
+    logger.info("TIMING [file_read]: 0.000 s (%d bytes, in-memory)", len(audio_bytes))
 
     async with httpx.AsyncClient(timeout=300) as client:
         resp = await client.post(
             DEEPGRAM_BASE,
             headers={
                 "Authorization": f"Token {DEEPGRAM_API_KEY}",
-                "Content-Type": mime_type,
+                "Content-Type": content_type,
             },
             params=DEFAULT_OPTIONS,
-            content=audio_data,
+            content=audio_bytes,
         )
         resp.raise_for_status()
         result = resp.json()
@@ -51,7 +42,7 @@ async def transcribe_audio(file_path: str) -> dict:
     api_time = time.time() - t0
     elapsed = time.time() - t0
     record_timing("deepgram", elapsed)
-    logger.info("TIMING [deepgram_api]: %.3f s (file_read=%.3f s)", api_time, file_read_time)
+    logger.info("TIMING [deepgram_api]: %.3f s (in-memory)", api_time)
 
     transcript = _extract_transcript(result)
     utterances = _extract_utterances(result)

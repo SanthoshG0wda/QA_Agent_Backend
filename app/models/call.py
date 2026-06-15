@@ -1,11 +1,10 @@
 from datetime import datetime, timezone
 
 
-def create_call_doc(filename: str, file_path: str = "", transcript: str = "",
+def create_call_doc(filename: str, transcript: str = "",
                     uploaded_by: str = "", agent_id: str = "") -> dict:
     return {
         "filename": filename,
-        "file_path": file_path,
         "transcript": transcript,
         "deepgram_utterances": [],
         "agent_customer_transcript": "",

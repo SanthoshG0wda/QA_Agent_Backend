@@ -1,11 +1,8 @@
-import os
-import uuid
 import asyncio
 import logging
 from bson import ObjectId
 from bson.errors import InvalidId
 from fastapi import APIRouter, UploadFile, File, HTTPException, Depends
-from ..config import UPLOAD_DIR
 from ..database import get_db
 from ..models.call import create_call_doc, call_to_dict
 from ..auth.token_utils import get_current_user
@@ -27,10 +24,9 @@ def _validate_id(id_str: str, name: str = "id") -> ObjectId:
         raise HTTPException(400, f"Invalid {name}: '{id_str}' is not a valid ID")
 
 
-async def _run_with_timeout(call_id: str, file_path: str):
-    """Wrap processing in a timeout so stuck tasks don't hang forever."""
+async def _run_with_timeout(call_id: str, audio_bytes: bytes, content_type: str):
     try:
-        await asyncio.wait_for(_process_upload(call_id, file_path), timeout=_PROCESSING_TIMEOUT)
+        await asyncio.wait_for(_process_upload(call_id, audio_bytes, content_type), timeout=_PROCESSING_TIMEOUT)
     except asyncio.TimeoutError:
         logger.error("Upload %s: processing timed out after %ds", call_id, _PROCESSING_TIMEOUT)
         db = get_db()
@@ -45,8 +41,7 @@ async def _run_with_timeout(call_id: str, file_path: str):
                 pass
 
 
-async def _process_upload(call_id: str, file_path: str):
-    """Background processor for uploaded calls using Deepgram."""
+async def _process_upload(call_id: str, audio_bytes: bytes, content_type: str):
     db = get_db()
     if db is None:
         return
@@ -60,7 +55,7 @@ async def _process_upload(call_id: str, file_path: str):
 
     update_fields = {}
     try:
-        raw_transcript, utterances = await transcribe_audio(file_path)
+        raw_transcript, utterances = await transcribe_audio(audio_bytes, content_type)
         update_fields["transcript"] = raw_transcript
         update_fields["deepgram_utterances"] = utterances
         logger.info("Upload %s: Deepgram transcription completed (%d utterances)", call_id, len(utterances))
@@ -125,27 +120,20 @@ async def upload_audio(file: UploadFile = File(...), payload: dict = Depends(get
     if not file.filename:
         raise HTTPException(400, "No file provided")
 
-    os.makedirs(UPLOAD_DIR, exist_ok=True)
-    ext = os.path.splitext(file.filename)[1] or ".wav"
-    stored_name = f"{uuid.uuid4()}{ext}"
-    file_path = os.path.join(UPLOAD_DIR, stored_name)
-
     content = await file.read()
-    with open(file_path, "wb") as f:
-        f.write(content)
+    content_type = file.content_type or "audio/wav"
 
     db = get_db()
     if db is None:
         raise HTTPException(503, "Database not connected")
     call_doc = create_call_doc(
         filename=file.filename,
-        file_path=file_path,
         uploaded_by=payload.get("sub", ""),
     )
     result = await db.calls.insert_one(call_doc)
     call_id = str(result.inserted_id)
 
-    task = asyncio.create_task(_run_with_timeout(call_id, file_path))
+    task = asyncio.create_task(_run_with_timeout(call_id, content, content_type))
     _background_tasks.add(task)
     task.add_done_callback(_background_tasks.discard)
 
