@@ -1,8 +1,8 @@
 import httpx
 import logging
 import time
-from ..config import DEEPGRAM_API_KEY
 from ..services.timing import record_timing
+from ..services.settings_service import get_deepgram_api_key
 
 logger = logging.getLogger(__name__)
 
@@ -19,20 +19,26 @@ DEFAULT_OPTIONS = {
 
 
 async def transcribe_audio(audio_bytes: bytes, content_type: str = "audio/wav") -> dict:
-    if not DEEPGRAM_API_KEY:
+    deepgram_api_key = await get_deepgram_api_key()
+    if not deepgram_api_key:
         raise RuntimeError("DEEPGRAM_API_KEY is not set")
 
     t0 = time.time()
     logger.info("TIMING [file_read]: 0.000 s (%d bytes, in-memory)", len(audio_bytes))
 
+    params = DEFAULT_OPTIONS.copy()
+    # Help Deepgram detect AAC explicitly
+    if content_type.startswith("audio/aac") or content_type.startswith("audio/x-aac"):
+        params["encoding"] = "aac"
+
     async with httpx.AsyncClient(timeout=300) as client:
         resp = await client.post(
             DEEPGRAM_BASE,
             headers={
-                "Authorization": f"Token {DEEPGRAM_API_KEY}",
+                "Authorization": f"Token {deepgram_api_key}",
                 "Content-Type": content_type,
             },
-            params=DEFAULT_OPTIONS,
+            params=params,
             content=audio_bytes,
         )
         resp.raise_for_status()

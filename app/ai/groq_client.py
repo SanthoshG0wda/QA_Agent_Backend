@@ -1,9 +1,10 @@
 import httpx
 import logging
 import time
-from ..config import GROQ_API_KEY, GROQ_MODEL
+from ..config import GROQ_MODEL
 from ..services.timing import record_timing
 from ..services.json_parser import safe_json_parse
+from ..services.settings_service import get_groq_api_key
 
 logger = logging.getLogger(__name__)
 
@@ -88,7 +89,8 @@ Return ONLY valid JSON with this exact structure:
 
 
 async def evaluate_transcript(transcript: str) -> dict:
-    if not GROQ_API_KEY:
+    groq_api_key = await get_groq_api_key()
+    if not groq_api_key:
         return _fallback_result()
 
     t0 = time.time()
@@ -97,7 +99,7 @@ async def evaluate_transcript(transcript: str) -> dict:
             resp = await client.post(
                 "https://api.groq.com/openai/v1/chat/completions",
                 headers={
-                    "Authorization": f"Bearer {GROQ_API_KEY}",
+                    "Authorization": f"Bearer {groq_api_key}",
                     "Content-Type": "application/json",
                 },
                 json={

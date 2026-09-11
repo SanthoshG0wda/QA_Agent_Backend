@@ -219,8 +219,20 @@ async def upload_audio(
     if not file.filename:
         raise HTTPException(400, "No file provided")
 
+    # Allow common audio formats including AAC
+    allowed_exts = {".wav", ".mp3", ".m4a", ".aac", ".flac", ".ogg", ".webm"}
+    import os
+    ext = os.path.splitext(file.filename.lower())[1]
+    if ext not in allowed_exts:
+        raise HTTPException(400, f"Unsupported audio format: {ext}. Allowed: {', '.join(allowed_exts)}")
+
     content = await file.read()
     content_type = file.content_type or "audio/wav"
+    # Normalize AAC mime types
+    if ext == ".aac" and not content_type.startswith("audio/aac"):
+        content_type = "audio/aac"
+    
+    logger.info("Upload request: filename=%s ext=%s content_type=%s size=%d", file.filename, ext, content_type, len(content))
 
     db = get_db()
     if db is None:

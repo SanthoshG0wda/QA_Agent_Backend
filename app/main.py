@@ -20,6 +20,8 @@ from .routes.performance import router as performance_router
 from .routes.departments import router as departments_router
 from .routes.notifications import router as notifications_router
 from .routes.jobs import router as jobs_router
+from .routes.settings import router as settings_router
+from .routes.observability import router as observability_router
 
 
 logger = logging.getLogger(__name__)
@@ -148,3 +150,5 @@ app.include_router(performance_router, prefix="/api")
 app.include_router(departments_router, prefix="/api")
 app.include_router(notifications_router, prefix="/api")
 app.include_router(jobs_router, prefix="/api")
+app.include_router(settings_router, prefix="/api")
+app.include_router(observability_router, prefix="/api")

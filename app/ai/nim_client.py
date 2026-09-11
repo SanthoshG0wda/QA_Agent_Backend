@@ -1,9 +1,10 @@
 import httpx
 import logging
 import time
-from ..config import NVIDIA_API_KEY, NVIDIA_MODEL, NVIDIA_BASE_URL
+from ..config import NVIDIA_MODEL, NVIDIA_BASE_URL
 from ..services.timing import record_timing
 from ..services.json_parser import safe_json_parse
+from ..services.settings_service import get_nvidia_api_key
 
 logger = logging.getLogger(__name__)
 
@@ -34,7 +35,8 @@ If no critical errors found:
 
 
 async def detect_critical_errors(transcript: str) -> dict:
-    if not NVIDIA_API_KEY:
+    nvidia_api_key = await get_nvidia_api_key()
+    if not nvidia_api_key:
         return {"critical_error": False, "errors": []}
 
     t0 = time.time()
@@ -43,7 +45,7 @@ async def detect_critical_errors(transcript: str) -> dict:
             resp = await client.post(
                 f"{NVIDIA_BASE_URL}/chat/completions",
                 headers={
-                    "Authorization": f"Bearer {NVIDIA_API_KEY}",
+                    "Authorization": f"Bearer {nvidia_api_key}",
                     "Content-Type": "application/json",
                 },
                 json={

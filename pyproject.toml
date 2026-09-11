@@ -1,0 +1,18 @@
+[project]
+name = "qa-agent-backend"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "bcrypt==4.2.1",
+    "fastapi==0.115.0",
+    "httpx==0.27.2",
+    "motor==3.7.0",
+    "passlib[bcrypt]==1.7.4",
+    "pymongo==4.9.2",
+    "python-dotenv==1.0.1",
+    "python-jose[cryptography]==3.3.0",
+    "python-multipart==0.0.12",
+    "uvicorn[standard]==0.30.6",
+]

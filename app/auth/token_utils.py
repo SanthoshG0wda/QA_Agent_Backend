@@ -42,3 +42,10 @@ def require_role(role: str):
             raise HTTPException(403, "Insufficient permissions")
         return payload
     return role_checker
+
+def require_exact_role(role: str):
+    async def role_checker(payload: dict = Depends(get_current_user)):
+        if payload.get("role") != role:
+            raise HTTPException(403, "Insufficient permissions")
+        return payload
+    return role_checker
