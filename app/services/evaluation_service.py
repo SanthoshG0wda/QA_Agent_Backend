@@ -228,15 +228,17 @@ async def evaluate_call(call_doc: dict, deepgram_utterances: list[dict], raw_tra
     eval_status = "completed"
     eval_error = None
 
-    if groq_result.get("groq_error") and nim_result.get("nim_error"):
+    if groq_result.get("groq_error") and (nim_result.get("nim_error") or not ENABLE_NIM):
+        # Only mark failed if Groq failed and we have no alternate AI results
         eval_status = "failed"
-        eval_error = "Both Groq and NIM AI services failed"
-        warnings.append("Both AI services failed — partial or zero scores saved")
+        eval_error = "AI evaluation service failed"
+        warnings.append("AI evaluation service failed — partial or zero scores saved")
     elif groq_result.get("groq_error"):
         warnings.append("Groq evaluation partially failed — using fallback scores")
         eval_status = "completed"
     elif nim_result.get("nim_error"):
         warnings.append("NIM critical error detection unavailable")
+        eval_status = "completed"
 
     db = get_db()
     if db is None:
@@ -322,6 +324,8 @@ async def evaluate_call(call_doc: dict, deepgram_utterances: list[dict], raw_tra
         "corrected_conversation": groq_result.get("corrected_conversation", []),
         "normalized_conversation": normalized,
         "conversation_summary": conversation_summary,
+        "strengths": strengths,
+        "improvements": improvements,
         "role_mapping": role_mapping,
         "conversation_metrics": metrics,
         "quality_findings": quality_findings,

@@ -16,7 +16,23 @@ router = APIRouter()
 
 # Strong reference set to prevent GC from collecting background tasks
 _background_tasks: set[asyncio.Task] = set()
+_active_call_tasks: dict[str, asyncio.Task] = {}
 _PROCESSING_TIMEOUT = 300  # 5 minutes max per call
+
+def register_task(call_id: str, task: asyncio.Task):
+    _active_call_tasks[call_id] = task
+    _background_tasks.add(task)
+    def _cleanup(t):
+        _background_tasks.discard(t)
+        _active_call_tasks.pop(call_id, None)
+    task.add_done_callback(_cleanup)
+
+def cancel_task_for_call(call_id: str) -> bool:
+    task = _active_call_tasks.get(call_id)
+    if task and not task.done():
+        task.cancel()
+        return True
+    return False
 
 # Concurrency control semaphore — limits simultaneous Deepgram/Groq/NIM calls
 _processing_semaphore = asyncio.Semaphore(MAX_CONCURRENT_JOBS)
@@ -59,8 +75,8 @@ async def _run_with_timeout(call_id: str, audio_bytes: bytes, content_type: str)
             await asyncio.wait_for(_process_upload(call_id, audio_bytes, content_type), timeout=_PROCESSING_TIMEOUT)
             _running_count -= 1
     except asyncio.TimeoutError:
-        _queued_count -= 1
-        _running_count -= 1
+        _queued_count = max(0, _queued_count - 1)
+        _running_count = max(0, _running_count - 1)
         logger.error("Upload %s: processing timed out after %ds", call_id, _PROCESSING_TIMEOUT)
         db = get_db()
         if db is not None:
@@ -68,7 +84,36 @@ async def _run_with_timeout(call_id: str, audio_bytes: bytes, content_type: str)
                 obj_id = _validate_id(call_id, "call_id")
                 await db.calls.update_one(
                     {"_id": obj_id},
-                    {"$set": {"processing_status": "failed", "error": "Processing timed out"}},
+                    {"$set": {"processing_status": "failed", "error": "Processing timed out", "progress": 0}},
+                )
+            except Exception:
+                pass
+    except asyncio.CancelledError:
+        _queued_count = max(0, _queued_count - 1)
+        _running_count = max(0, _running_count - 1)
+        logger.info("Upload %s: processing cancelled by user", call_id)
+        db = get_db()
+        if db is not None:
+            try:
+                obj_id = _validate_id(call_id, "call_id")
+                await db.calls.update_one(
+                    {"_id": obj_id},
+                    {"$set": {"processing_status": "cancelled", "error": "Job cancelled by user", "progress": 0}},
+                )
+            except Exception:
+                pass
+        raise
+    except Exception as e:
+        _queued_count = max(0, _queued_count - 1)
+        _running_count = max(0, _running_count - 1)
+        logger.error("Upload %s: unexpected error in processing: %s", call_id, e, exc_info=True)
+        db = get_db()
+        if db is not None:
+            try:
+                obj_id = _validate_id(call_id, "call_id")
+                await db.calls.update_one(
+                    {"_id": obj_id},
+                    {"$set": {"processing_status": "failed", "error": str(e), "progress": 0}},
                 )
             except Exception:
                 pass
@@ -150,7 +195,9 @@ async def _process_upload(call_id: str, audio_bytes: bytes, content_type: str):
 
         update_fields["overall_score"] = eval_result.get("overall_score", 0)
         update_fields["critical_error"] = eval_result.get("critical_error", False)
-        update_fields["progress"] = 100
+        update_fields["progress"] = 100 if eval_status == "completed" else 0
+        if eval_result.get("evaluation_id"):
+            update_fields["evaluation_id"] = eval_result["evaluation_id"]
 
         await db.calls.update_one({"_id": obj_id}, {"$set": update_fields})
 
@@ -266,8 +313,7 @@ async def upload_audio(
     call_id = str(result.inserted_id)
 
     task = asyncio.create_task(_run_with_timeout(call_id, content, content_type))
-    _background_tasks.add(task)
-    task.add_done_callback(_background_tasks.discard)
+    register_task(call_id, task)
 
     return {
         "call_id": call_id,
@@ -288,11 +334,15 @@ async def list_calls(_=Depends(get_current_user)):
 
 @router.get("/calls/{call_id}")
 async def get_call(call_id: str, _=Depends(get_current_user)):
-    obj_id = _validate_id(call_id, "call_id")
     db = get_db()
     if db is None:
         raise HTTPException(503, "Database not connected")
-    doc = await db.calls.find_one({"_id": obj_id})
+    query = {"$or": [{"job_id": call_id}]}
+    try:
+        query["$or"].append({"_id": ObjectId(call_id)})
+    except (InvalidId, TypeError):
+        pass
+    doc = await db.calls.find_one(query)
     if not doc:
         raise HTTPException(404, "Call not found")
     return call_to_dict(doc)
@@ -300,18 +350,30 @@ async def get_call(call_id: str, _=Depends(get_current_user)):
 
 @router.get("/calls/{call_id}/evaluation")
 async def get_call_evaluation(call_id: str, _=Depends(get_current_user)):
-    obj_id = _validate_id(call_id, "call_id")
     db = get_db()
     if db is None:
         raise HTTPException(503, "Database not connected")
-    call_doc = await db.calls.find_one({"_id": obj_id})
+    query = {"$or": [{"job_id": call_id}]}
+    try:
+        query["$or"].append({"_id": ObjectId(call_id)})
+    except (InvalidId, TypeError):
+        pass
+    call_doc = await db.calls.find_one(query)
     if not call_doc:
         raise HTTPException(404, "Call not found")
-    eval_doc = await db.evaluations.find_one({"call_id": call_id})
+    actual_call_id = str(call_doc["_id"])
+    eval_doc = None
+    if call_doc.get("evaluation_id"):
+        try:
+            eval_doc = await db.evaluations.find_one({"_id": ObjectId(call_doc["evaluation_id"])})
+        except Exception:
+            pass
+    if not eval_doc:
+        eval_doc = await db.evaluations.find_one({"call_id": actual_call_id})
     if not eval_doc:
         return {
             "id": "",
-            "call_id": call_id,
+            "call_id": actual_call_id,
             "processing_status": call_doc.get("processing_status", "pending"),
             "transcript": call_doc.get("transcript", ""),
             "deepgram_utterances": call_doc.get("deepgram_utterances", []),
@@ -361,9 +423,10 @@ async def delete_call(call_id: str, payload: dict = Depends(get_current_user)):
     db = get_db()
     if db is None:
         raise HTTPException(503, "Database not connected")
-    if payload.get("role") != "admin":
-        raise HTTPException(403, "Admin only")
+    cancel_task_for_call(call_id)
     result = await db.calls.delete_one({"_id": obj_id})
     if result.deleted_count == 0:
         raise HTTPException(404, "Call not found")
+    await db.evaluations.delete_many({"call_id": call_id})
+    await db.notifications.delete_many({"call_id": call_id})
     return {"ok": True}

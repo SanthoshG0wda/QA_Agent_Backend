@@ -14,7 +14,7 @@ DEFAULT_OPTIONS = {
     "smart_format": "true",
     "punctuate": "true",
     "utterances": "true",
-    "diarize": "false",
+    "diarize": "true",
 }
 
 

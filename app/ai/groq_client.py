@@ -1,3 +1,4 @@
+import asyncio
 import httpx
 import logging
 import time
@@ -94,36 +95,43 @@ async def evaluate_transcript(transcript: str) -> dict:
         return _fallback_result()
 
     t0 = time.time()
-    try:
-        async with httpx.AsyncClient(timeout=120) as client:
-            resp = await client.post(
-                "https://api.groq.com/openai/v1/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {groq_api_key}",
-                    "Content-Type": "application/json",
-                },
-                json={
-                    "model": GROQ_MODEL,
-                    "messages": [
-                        {"role": "system", "content": SYSTEM_PROMPT},
-                        {"role": "user", "content": f"Evaluate this call transcript:\n\n{transcript}"},
-                    ],
-                    "temperature": 0.1,
-                    "response_format": {"type": "json_object"},
-                },
-            )
-            resp.raise_for_status()
-            data = resp.json()
-            content = data["choices"][0]["message"]["content"]
-            result = safe_json_parse(content, _fallback_result())
-            record_timing("groq", time.time() - t0)
-            return result
-    except httpx.HTTPStatusError as e:
-        logger.error("Groq HTTP error: %s - %s", e.response.status_code, e.response.text[:500])
-    except httpx.TimeoutException:
-        logger.error("Groq request timed out after 120s")
-    except Exception as e:
-        logger.error("Groq request failed: %s", e, exc_info=True)
+    for attempt in range(2):
+        try:
+            async with httpx.AsyncClient(timeout=120) as client:
+                resp = await client.post(
+                    "https://api.groq.com/openai/v1/chat/completions",
+                    headers={
+                        "Authorization": f"Bearer {groq_api_key}",
+                        "Content-Type": "application/json",
+                    },
+                    json={
+                        "model": GROQ_MODEL,
+                        "messages": [
+                            {"role": "system", "content": SYSTEM_PROMPT},
+                            {"role": "user", "content": f"Evaluate this call transcript:\n\n{transcript}"},
+                        ],
+                        "temperature": 0.1,
+                        "response_format": {"type": "json_object"},
+                    },
+                )
+                resp.raise_for_status()
+                data = resp.json()
+                content = data["choices"][0]["message"]["content"]
+                result = safe_json_parse(content, _fallback_result())
+                record_timing("groq", time.time() - t0)
+                return result
+        except httpx.HTTPStatusError as e:
+            logger.error("Groq HTTP error (attempt %d): %s - %s", attempt + 1, e.response.status_code, e.response.text[:500])
+            if attempt == 0:
+                await asyncio.sleep(1)
+        except httpx.TimeoutException:
+            logger.error("Groq request timed out after 120s (attempt %d)", attempt + 1)
+            if attempt == 0:
+                await asyncio.sleep(1)
+        except Exception as e:
+            logger.error("Groq request failed (attempt %d): %s", attempt + 1, e, exc_info=True)
+            if attempt == 0:
+                await asyncio.sleep(1)
 
     record_timing("groq", time.time() - t0)
     result = _fallback_result()

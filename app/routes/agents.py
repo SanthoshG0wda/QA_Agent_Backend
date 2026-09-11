@@ -11,6 +11,7 @@ from ..auth.token_utils import get_current_user, require_role
 from pydantic import BaseModel
 from ..services.transcription import transcribe_audio
 from ..services.evaluation_service import evaluate_call
+from .upload import _next_job_id, register_task, _update_progress
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -127,7 +128,32 @@ async def _run_agent_timeout(call_id: str, audio_bytes: bytes, content_type: str
                 obj_id = _validate_id(call_id, "call_id")
                 await db.calls.update_one(
                     {"_id": obj_id},
-                    {"$set": {"processing_status": "failed", "error": "Processing timed out"}},
+                    {"$set": {"processing_status": "failed", "error": "Processing timed out", "progress": 0}},
+                )
+            except Exception:
+                pass
+    except asyncio.CancelledError:
+        logger.info("Agent call %s: processing cancelled by user", call_id)
+        db = get_db()
+        if db is not None:
+            try:
+                obj_id = _validate_id(call_id, "call_id")
+                await db.calls.update_one(
+                    {"_id": obj_id},
+                    {"$set": {"processing_status": "cancelled", "error": "Job cancelled by user", "progress": 0}},
+                )
+            except Exception:
+                pass
+        raise
+    except Exception as e:
+        logger.error("Agent call %s: unexpected error in processing: %s", call_id, e, exc_info=True)
+        db = get_db()
+        if db is not None:
+            try:
+                obj_id = _validate_id(call_id, "call_id")
+                await db.calls.update_one(
+                    {"_id": obj_id},
+                    {"$set": {"processing_status": "failed", "error": str(e), "progress": 0}},
                 )
             except Exception:
                 pass
@@ -142,7 +168,7 @@ async def _process_agent_call(call_id: str, audio_bytes: bytes, content_type: st
         return
 
     obj_id = _validate_id(call_id, "call_id")
-    await db.calls.update_one({"_id": obj_id}, {"$set": {"processing_status": "processing"}})
+    await db.calls.update_one({"_id": obj_id}, {"$set": {"processing_status": "processing", "progress": 15}})
 
     update_fields = {}
     try:
@@ -151,17 +177,21 @@ async def _process_agent_call(call_id: str, audio_bytes: bytes, content_type: st
         update_fields["deepgram_utterances"] = utterances
         update_fields["duration_seconds"] = duration_seconds
         logger.info("Agent call %s: Deepgram transcription completed (%d utterances, %.1fs)", call_id, len(utterances), duration_seconds)
+        await _update_progress(call_id, 45)
 
         call_doc = await db.calls.find_one({"_id": obj_id})
         if not call_doc:
             return
 
         try:
+            await _update_progress(call_id, 65)
             eval_result = await evaluate_call(call_doc, utterances, raw_transcript)
+            await _update_progress(call_id, 90)
         except Exception as e:
             logger.error("Agent call %s: evaluation pipeline failed: %s", call_id, e, exc_info=True)
             update_fields["processing_status"] = "failed"
             update_fields["eval_error"] = str(e)
+            update_fields["progress"] = 0
             await db.calls.update_one({"_id": obj_id}, {"$set": update_fields})
             return
 
@@ -193,6 +223,9 @@ async def _process_agent_call(call_id: str, audio_bytes: bytes, content_type: st
 
         update_fields["overall_score"] = eval_result.get("overall_score", 0)
         update_fields["critical_error"] = eval_result.get("critical_error", False)
+        update_fields["progress"] = 100 if eval_status == "completed" else 0
+        if eval_result.get("evaluation_id"):
+            update_fields["evaluation_id"] = eval_result["evaluation_id"]
 
         await db.calls.update_one({"_id": obj_id}, {"$set": update_fields})
 
@@ -204,6 +237,7 @@ async def _process_agent_call(call_id: str, audio_bytes: bytes, content_type: st
         logger.error("Agent call %s processing failed: %s", call_id, e, exc_info=True)
         update_fields["processing_status"] = "failed"
         update_fields["error"] = str(e)
+        update_fields["progress"] = 0
         await db.calls.update_one(
             {"_id": obj_id},
             {"$set": update_fields},
@@ -212,7 +246,7 @@ async def _process_agent_call(call_id: str, audio_bytes: bytes, content_type: st
 
 @router.post("/agents/{agent_id}/upload")
 async def upload_agent_call(agent_id: str, file: UploadFile = File(...),
-                            _=Depends(require_role("admin"))):
+                            payload: dict = Depends(get_current_user)):
     db = get_db()
     if db is None:
         raise HTTPException(503, "Database not connected")
@@ -228,24 +262,26 @@ async def upload_agent_call(agent_id: str, file: UploadFile = File(...),
     agent_name = agent_doc.get("name", "")
     department_id = agent_doc.get("department_id", "")
     department_name = agent_doc.get("department_name", "")
+    job_id = await _next_job_id(db)
 
     call_doc_data = create_call_doc(
         filename=file.filename,
-        uploaded_by=str(agent_doc["_id"]),
+        uploaded_by=payload.get("sub", str(agent_doc["_id"])),
         agent_id=agent_id,
         agent_name=agent_name,
         department_id=department_id,
         department_name=department_name,
+        job_id=job_id,
     )
     result = await db.calls.insert_one(call_doc_data)
     call_id = str(result.inserted_id)
 
     task = asyncio.create_task(_run_agent_timeout(call_id, content, content_type))
-    _background_tasks.add(task)
-    task.add_done_callback(_background_tasks.discard)
+    register_task(call_id, task)
 
     return {
         "call_id": call_id,
+        "job_id": job_id,
         "status": "processing",
         "message": "Call upload received. Processing started. Poll GET /api/calls/{id} for status.",
     }

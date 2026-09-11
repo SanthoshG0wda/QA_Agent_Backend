@@ -1,4 +1,5 @@
 import logging
+from datetime import datetime, timezone
 from bson import ObjectId
 from bson.errors import InvalidId
 from fastapi import APIRouter, HTTPException, Depends
@@ -144,21 +145,62 @@ async def get_evaluation(evaluation_id: str, _=Depends(get_current_user)):
 
 @router.get("/calls/{call_id}/status")
 async def get_call_status(call_id: str, _=Depends(get_current_user)):
-    obj_id = _validate_id(call_id, "call_id")
     db = get_db()
     if db is None:
         raise HTTPException(503, "Database not connected")
-    call_doc = await db.calls.find_one({"_id": obj_id})
+
+    query = {"$or": [{"job_id": call_id}]}
+    try:
+        query["$or"].append({"_id": ObjectId(call_id)})
+    except (InvalidId, TypeError):
+        pass
+
+    call_doc = await db.calls.find_one(query)
     if not call_doc:
         raise HTTPException(404, "Call not found")
+
+    actual_call_id = str(call_doc["_id"])
     status = call_doc.get("processing_status", "pending")
-    result = {"call_id": call_id, "status": status, "progress": call_doc.get("progress", 0)}
+
+    # Auto-heal stale/interrupted jobs that exceeded timeout and have no active background task
+    if status in ["processing", "pending", "queued"]:
+        created_at = call_doc.get("created_at")
+        if created_at:
+            if getattr(created_at, "tzinfo", None) is None:
+                created_at = created_at.replace(tzinfo=timezone.utc)
+            now = datetime.now(timezone.utc)
+            if (now - created_at).total_seconds() > 300:
+                from .upload import _active_call_tasks
+                if actual_call_id not in _active_call_tasks:
+                    status = "failed"
+                    stale_error = "Processing timed out or task interrupted"
+                    await db.calls.update_one(
+                        {"_id": call_doc["_id"]},
+                        {"$set": {"processing_status": "failed", "error": stale_error, "progress": 0}},
+                    )
+                    call_doc["processing_status"] = "failed"
+                    call_doc["error"] = stale_error
+
+    result = {
+        "call_id": actual_call_id,
+        "job_id": call_doc.get("job_id", ""),
+        "status": status,
+        "progress": call_doc.get("progress", 0) if status != "failed" else 0,
+    }
     if status == "failed":
-        result["error"] = call_doc.get("transcript_error") or call_doc.get("eval_error") or "Processing failed"
-    eval_doc = await db.evaluations.find_one({"call_id": call_id})
-    if eval_doc:
-        result["evaluation_id"] = str(eval_doc["_id"])
-        result["evaluation_status"] = eval_doc.get("status", "completed")
+        result["error"] = call_doc.get("transcript_error") or call_doc.get("eval_error") or call_doc.get("error") or "Processing failed"
+    elif status == "cancelled":
+        result["error"] = call_doc.get("error") or "Job was ended by user"
+
+    eval_id = call_doc.get("evaluation_id")
+    if not eval_id:
+        eval_doc = await db.evaluations.find_one({"call_id": actual_call_id})
+        if eval_doc:
+            eval_id = str(eval_doc["_id"])
+            result["evaluation_status"] = eval_doc.get("status", "completed")
+    if eval_id:
+        result["evaluation_id"] = str(eval_id)
+
     return result
 
 
